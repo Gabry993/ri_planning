@@ -2,8 +2,10 @@ import itertools
 import math
 from abc import ABC
 from collections import ChainMap, defaultdict
+from collections.abc import Mapping as MappingABC
 from functools import lru_cache, partial
 from heapq import heappop, heappush
+
 import lxml.etree as ET
 
 import networkx as nx
@@ -11,10 +13,8 @@ from rtree import index
 from shapely.geometry import LinearRing, LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import cascaded_union
-from typing import (Any, Callable, Dict, Iterator, List, Mapping, Optional,
-                    Set, Tuple, Type, TypeVar, Union, cast, Iterable)
-
-from collections.abc import Mapping as MappingABC
+from typing import (Any, Callable, Dict, Iterator, List, Mapping,
+                    Optional, Set, Tuple, Type, TypeVar, Union, cast)
 
 # import xml.etree.ElementTree as ET
 
@@ -483,9 +483,6 @@ class Cell(GMLFeature):
     cls_name: Optional[str] = None
     function: Optional[str] = None
 
-    # outer_edge: dcel.Edge
-    # inner_edges: List[dcel.Edge]
-
     def __init__(self, uid: str) -> None:
         super(Cell, self).__init__(uid)
         self.boundary = []
@@ -504,8 +501,6 @@ class Cell(GMLFeature):
     #         self.boundary.remove(boundary)
     #         boundary.remove_cell(self)
 
-
-
     # def reset_geometry(self) -> None:
     #     outer = geometry.LineString([e.origin for e in self.outer_edge.follow()])
     #     inner = [geometry.LineString([e.origin for e in edge.follow()])
@@ -513,6 +508,12 @@ class Cell(GMLFeature):
     #     self.geometry = geometry.Polygon(outer, inner)
     #     if self.duality:
     #         self.duality.reset_geometry()
+
+    # @classmethod
+    # def from_polygon(cls, uid, polygon, prefix=''):
+    #     cell = Cell(f"{prefix}C{uid}")
+    #     cell.geometry = polygon
+    #     return cell
 
     def init_from_xml(self, node: ET.Element, layer: 'Layer') -> None:
         external_ref = node.find('indoorCore:externalReference', nsmap)
@@ -561,12 +562,6 @@ class Cell(GMLFeature):
                 raise Exception("Invalid Cell %s: %s" %
                                 (self.id, self.geometry.wkt))
 
-    # @classmethod
-    # def from_polygon(cls, uid, polygon, prefix=''):
-    #     cell = Cell(f"{prefix}C{uid}")
-    #     cell.geometry = polygon
-    #     return cell
-
     def xml(self, ref: Optional[Set[str]] = None) -> ET.Element:
         root = super(Cell, self).xml(ref=ref)
         if self.geometry:
@@ -606,24 +601,10 @@ class Boundary(GMLFeature):
     duality: Optional[Transition] = None
     cells: List[Cell]
 
-    # outer_edge: dcel.Edge
-    # inner_edges: List[dcel.Edge]
-
     def __init__(self, uid: str) -> None:
         super(Boundary, self).__init__(uid)
         # self._chains: Dict[str: dcel.Edge] = {}
         self.cells = []
-
-    # def follow(self, cell: Cell) -> Generator[dcel.Edge]:
-    #     start, end = self.chainInCell(cell)
-    #     if start and end:
-    #         yield start.to(end)
-    #
-
-    #
-
-    #
-
 
     # def add_cell(self, cell: Cell) -> None:
     #     self.cells.append(cell)
@@ -631,8 +612,6 @@ class Boundary(GMLFeature):
     # def remove_cell(self, cell: Cell) -> None:
     #     if cell in self.cells:
     #         self.cells.remove(cell)
-
-
 
     # def reset_geometry(self) -> None:
     #     if len(self.cells) == 0:
@@ -649,6 +628,12 @@ class Boundary(GMLFeature):
     #     if self.duality:
     #         self.duality.reset_geometry()
 
+    # @classmethod
+    # def from_line(uid: str, line: LineString, prefix: str = ''):
+    #     b = Boundary(f"{prefix}B{uid}")
+    #     b.geometry = line
+    #     return b
+
     def init_from_xml(self, node: ET.Element, layer: 'Layer') -> None:
         line: Optional[List[Point2D]] = None
         for pos_list in node.findall('indoorCore:geometry2D/gml:LineString/gml:posList', nsmap):
@@ -658,12 +643,6 @@ class Boundary(GMLFeature):
         if not self.geometry.is_valid:
             raise Exception("Invalid Boundary %s %s" %
                             (self.id, self.geometry.wkt))
-
-    # @classmethod
-    # def from_line(uid: str, line: LineString, prefix: str = ''):
-    #     b = Boundary(f"{prefix}B{uid}")
-    #     b.geometry = line
-    #     return b
 
     def xml(self, ref: Optional[Set[str]] = None) -> ET.Element:
         root = super(Boundary, self).xml(ref=ref)
@@ -761,8 +740,6 @@ class Layer(GMLFeature):
 
         layer.external_states = [
             s for s in layer.states.values() if not s.geometry]
-
-        # layer.init_DCEL();
 
         return layer
 
@@ -872,6 +849,15 @@ class Map(GMLFeature, MappingABC):
     #     else:
     #         return None
 
+    # def push_layer(self, layer):
+    #     self.addLayer(layer)
+    #     self.states.update(layer.states)
+    #     self.cells.update(layer.cells)
+    #     self.boundaries.update(layer.boundaries)
+    #     self.transitions.update(layer.transitionsmap)
+    #     self.find_interlayer_edges()
+    #     self.find_bounds()
+
     def add_layer(self, layer: Layer) -> None:
         self.layers[layer.id] = layer
         layer.map = self
@@ -884,15 +870,6 @@ class Map(GMLFeature, MappingABC):
 
     def __iter__(self) -> Iterator:
         return iter(self.layers)
-
-    # def setCrsFromNode(self, node):
-    #     n = node.find("WGS84:translation", nsmap)
-    #     if n is not None:
-    #         self.origin = coordinatesFromGML(n)
-    #
-    #     n = node.find("WGS84:rotation", nsmap)
-    #     if n is not None:
-    #         self.angle = float(n.text)
 
     @classmethod
     def from_file(cls, file_name: str) -> 'Map':
@@ -947,15 +924,6 @@ class Map(GMLFeature, MappingABC):
             map_.add_layer(layer)
         map_.init_interlayer_edges()
         return map_
-
-    # def push_layer(self, layer):
-    #     self.addLayer(layer)
-    #     self.states.update(layer.states)
-    #     self.cells.update(layer.cells)
-    #     self.boundaries.update(layer.boundaries)
-    #     self.transitions.update(layer.transitionsmap)
-    #     self.find_interlayer_edges()
-    #     self.find_bounds()
 
     def init_interlayer_edges(self) -> None:
 

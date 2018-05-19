@@ -8,7 +8,7 @@ from shapely.geometry import LinearRing, LineString
 from shapely.ops import polygonize
 from typing import Any, Dict, List, NamedTuple, Optional
 
-from .map import Boundary, Cell, Iterator, Layer, BoundinxBox
+from .map import Boundary, BoundinxBox, Cell, Iterator, Layer
 
 Point2D = Any
 Vertex = Point2D
@@ -31,9 +31,6 @@ class Chain(NamedTuple):
     @property
     def edges(self) -> Iterator['Edge']:
         return self.start.to(self.end)
-
-    def _repr_svg_(self) -> str:
-        ...
 
 
 # def orient(p1, p2, p3):
