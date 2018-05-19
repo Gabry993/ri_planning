@@ -1,21 +1,20 @@
 import itertools
-# import xml.etree.ElementTree as ET
+from abc import ABC
+from collections import ChainMap, defaultdict
+from functools import lru_cache, partial
+from heapq import heappop, heappush
 
 import lxml.etree as ET
 
-from abc import ABC
-from collections import ChainMap, defaultdict
-from heapq import heappop, heappush
-
 import networkx as nx
 from rtree import index
-from shapely.geometry.base import BaseGeometry
 from shapely.geometry import LinearRing, LineString, Point, Polygon
+from shapely.geometry.base import BaseGeometry
 from shapely.ops import cascaded_union
-from typing import (Dict, Generator, Iterable, List, Mapping, Optional, Set,
-                    Tuple, Type, TypeVar, cast, overload)
+from typing import (Any, Dict, List, Mapping, Optional, Set, Tuple, Type,
+                    TypeVar, cast)
 
-from functools import lru_cache, partial
+# import xml.etree.ElementTree as ET
 
 once = lru_cache(1, False)
 
@@ -27,10 +26,12 @@ BoundinxBox = Tuple[float, float, float, float]
 T = TypeVar('T', bound='GMLFeature')
 
 nsmap = {}
+nsmap_i = {}
 
 
 def add_ns(ET, name, url):
     nsmap[name] = url
+    nsmap_i[url] = name
 
 
 def name_ns(name, ns):
@@ -43,9 +44,86 @@ add_ns(ET, 'indoorCore', 'http://www.opengis.net/indoorgml/1.0/core')
 add_ns(ET, 'indoorNavi', 'http://www.opengis.net/indoorgml/1.0/navigation')
 add_ns(ET, 'xsi', 'http://www.w3.org/2001/XMLSchema-instance')
 # WGS84 localization
-add_ns(ET, 'WGS84', 'http://www.idsia.ch/alma')
+add_ns(ET, 'alma', 'http://www.idsia.ch/alma')
 
+gml = partial(name_ns, ns='gml')
+core = partial(name_ns, ns='indoorCore')
+nav = partial(name_ns, ns='indoorNavi')
 xlink = name_ns('href', 'xlink')
+
+
+def meta2dict(meta: ET.Element, root=False) -> Dict:
+    h, s, t = meta.tag.partition('}')
+    if not t:
+        ns = None
+        t = meta.tag
+    else:
+        ns = h[1:]
+    if len(meta) > 0:
+        v = dict(ChainMap(*(meta2dict(m) for m in meta)))
+    else:
+        if meta.text:
+            v = meta.text
+        else:
+            v = True
+    if root:
+        return v
+    return {(nsmap_i.get(ns, None), t): v}
+
+
+def dict2meta_partial(meta: Dict) -> List[ET.Element]:
+    es: List[ET.Element] = []
+    for k, v in meta.items():
+        e = ET.Element(name_ns(k[1], ns=k[0]))
+        print(e)
+        es.append(e)
+        if isinstance(v, dict):
+            e.extend(dict2meta_partial(v))
+        elif isinstance(v, str):
+            e.text = v
+        elif v is True:
+            pass
+        else:
+            raise NameError(f'Could not encode value {v} as xml')
+    return es
+
+
+def dict2meta(meta: Dict) -> ET.Element:
+    root = ET.Element(gml('metaDataProperty'))
+    metadata = ET.SubElement(root, gml('GenericMetaData'))
+    metadata.extend(dict2meta_partial(meta))
+    return root
+
+
+# ALMOST generic metadata:
+
+def add_bool_metadata(cls: Type[T], name: str):
+    def set_meta(self: T, value: bool) -> None:
+        if value:
+            self._meta[('alma', name)] = True
+        else:
+            del self._meta[('alma', name)]
+
+    def get_meta(self: T) -> bool:
+        return self.meta(name, ns='alma') or False
+
+    setattr(cls, name, property(fget=get_meta, fset=set_meta))
+
+
+def set_crs(self: 'Map', value: Tuple[float, float, float]) -> None:
+    x, y, a = value
+    self._meta[('alma', 'crs')] = {
+        ('alma', 'translation'): {('gml', 'pos'): f'{x} {y}'},
+        ('alma', 'rotation'): f'{a}'}
+
+
+def get_crs(self: 'Map') -> Optional[Tuple[float, float, float]]:
+    crs = self.meta('crs', ns='alma')
+    if not crs:
+        return None
+    x, y = map(float, crs[('alma', 'translation')][('gml', 'pos')].split())
+    a = float(crs[('alma', 'rotation')])
+    return (x, y, a)
 
 
 def coord_to_gml(shape: BaseGeometry) -> str:
@@ -55,43 +133,43 @@ def coord_to_gml(shape: BaseGeometry) -> str:
 def point_to_gml(point: Point, uid: Optional[str] = None) -> ET.Element:
     attribs = {'srsDimension': '2'}
     if uid is not None:
-        attribs[name_ns('id', 'gml')] = uid
-    gml = ET.Element(name_ns('Point', 'gml'), attribs)
-    pos = ET.SubElement(gml, name_ns('pos', 'gml'))
+        attribs[gml('id')] = uid
+    node = ET.Element(gml('Point'), attribs)
+    pos = ET.SubElement(node, gml('pos'))
     pos.text = coord_to_gml(point)
-    return gml
+    return node
 
 
 def line_to_gml(line: LineString, uid: Optional[str] = None) -> ET.Element:
     attribs = {}
     if uid is not None:
-        attribs[name_ns('id', 'gml')] = uid
-    gml = ET.Element(name_ns('LineString', 'gml'), attribs)
-    pos = ET.SubElement(gml, name_ns('posList', 'gml'))
+        attribs[gml('id')] = uid
+    node = ET.Element(gml('LineString'), attribs)
+    pos = ET.SubElement(node, gml('posList'))
     pos.text = coord_to_gml(line)
-    return gml
+    return node
 
 
 def ring_to_gml(ring: LinearRing, uid: Optional[str] = None) -> ET.Element:
     attribs = {}
     if uid is not None:
-        attribs[name_ns('id', 'gml')] = uid
-    gml = ET.Element(name_ns('LinearRing', 'gml'), attribs)
-    pos = ET.SubElement(gml, name_ns('posList', 'gml'))
+        attribs[gml('id')] = uid
+    node = ET.Element(gml('LinearRing'), attribs)
+    pos = ET.SubElement(node, gml('posList'))
     pos.text = coord_to_gml(ring)
-    return gml
+    return node
 
 
 def polygon_to_gml(polygon: Polygon, uid: Optional[str]) -> ET.Element:
     attribs = {}
     if uid is not None:
-        attribs[name_ns('id', 'gml')] = uid
-    gml = ET.Element(name_ns('Polygon', 'gml'), attribs)
-    exterior = ET.SubElement(gml, name_ns('exterior', "gml"))
+        attribs[gml('id')] = uid
+    node = ET.Element(gml('Polygon'), attribs)
+    exterior = ET.SubElement(node, gml('exterior'))
     exterior.append(ring_to_gml(polygon.exterior))
     for ring in polygon.interiors:
-        ET.SubElement(gml, name_ns('interior', 'gml')).append(ring_to_gml(ring))
-    return gml
+        ET.SubElement(node, gml('interior')).append(ring_to_gml(ring))
+    return node
 
 
 def is_stair(state):
@@ -101,7 +179,8 @@ def is_stair(state):
     return False
 
 
-_ns2types = {'indoorCore': ['CellSpace', 'CellSpaceBoundary', 'SpaceLayer', 'MultiLayeredGraph'],
+_ns2types = {'indoorCore': ['CellSpace', 'CellSpaceBoundary', 'SpaceLayer', 'MultiLayeredGraph',
+                            'State', 'Transition'],
              'indoorNavi': ['NavigableSpace', 'NavigableBoundary', 'GeneralSpace', 'TransferSpace',
                             'TransitionSpace', 'AnchorSpace', 'ConnectionSpace']}
 
@@ -136,6 +215,7 @@ class GMLFeature(ABC):
     description: Optional[str] = None
     type: str = 'GMLFeature'
     geometry: Optional[BaseGeometry]
+    _meta: Dict[Tuple[str, str], Any]
 
     def _repr_svg_(self) -> str:
         from indoorgml.display.svg import svg_for
@@ -155,15 +235,19 @@ class GMLFeature(ABC):
         tree.write(file_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
 
     def xml(self, ref: Optional[Set[str]] = None) -> ET.Element:
-        ns = _gml_ns.get(self.type, 'indoorCore')
-        root = ET.Element(name_ns(self.type, ns), {name_ns('id', 'gml'): self.id},
+        ns = _gml_ns.get(self.type)
+        root = ET.Element(name_ns(self.type, ns), {gml('id'): self.id},
                           nsmap=nsmap)
         if self.name:
-            name = ET.SubElement(root, name_ns('name', 'gml'))
+            name = ET.SubElement(root, gml('name'))
             name.text = self.name
         if self.description:
-            description = ET.SubElement(root, name_ns('description', 'gml'))
+            description = ET.SubElement(root, gml('description'))
             description.text = self.description
+
+        if self._meta:
+            root.append(dict2meta(self._meta))
+
         return root
 
     @property  # type: ignore
@@ -194,11 +278,20 @@ class GMLFeature(ABC):
         descNode = node.find('gml:description', nsmap)
         if descNode is not None:
             instance.description = descNode.text
+
+        meta = node.find('gml:metaDataProperty/gml:GenericMetaData', nsmap)
+        if meta is not None:
+            instance._meta = meta2dict(meta, root=True)
+        else:
+            instance._meta = {}
         return instance
 
     @property
     def bounds(self) -> BoundinxBox:
         return cast(BaseGeometry, self.geometry).bounds
+
+    def meta(self, name: str, ns: Optional[str] = None) -> Optional[Any]:
+        return self._meta.get((ns, name), None)
 
 
 class State(GMLFeature):
@@ -255,14 +348,6 @@ class State(GMLFeature):
         return (self.layer.cls_name == 'SENSOR' and self.name is not None and
                 self.name != 'NO' and self.duality is not None)
 
-    # @overload
-    # def from_xml(cls, node: None) -> None:
-    #     ...
-    #
-    # @overload
-    # def from_xml(cls, node: ET.Element) -> State:
-    #     ...
-
     def init_from_xml(self, node: ET.Element, layer: 'Layer') -> None:
         geometry_node = node.find('indoorCore:geometry//gml:pos', nsmap)
         if geometry_node is not None:
@@ -282,19 +367,24 @@ class State(GMLFeature):
         if self.duality:
 
             if ref and self.duality.id in ref:
-                ET.SubElement(root, name_ns('duality', 'indoorCore'),
+                ET.SubElement(root, core('duality'),
                               {xlink: f"#{self.duality.id}"})
             else:
-                ET.SubElement(root, name_ns('duality', 'indoorCore')).append(
+                ET.SubElement(root, core('duality')).append(
                     self.duality.xml(ref=ref))
 
         for transition in self.connects:
-            ET.SubElement(root, name_ns('connects', 'indoorCore'), {
+            ET.SubElement(root, core('connects'), {
                           xlink: f"#{transition.id}"})
         if self.geometry:
-            geometry = ET.SubElement(root, name_ns('geometry', 'indoorCore'))
+            geometry = ET.SubElement(root, core('geometry'))
             geometry.append(point_to_gml(self.geometry, f'G_{self.id}'))
         return root
+
+
+add_bool_metadata(State, name='open')
+add_bool_metadata(State, name='nontraversable')
+add_bool_metadata(State, name='invisible')
 
 
 class Transition(GMLFeature):
@@ -339,13 +429,13 @@ class Transition(GMLFeature):
     def xml(self, ref: Optional[Set[str]] = None) -> ET.Element:
         root = super(Transition, self).xml(ref=ref)
         for state in self.connects:
-            ET.SubElement(root, name_ns('connects', 'indoorCore'), {
+            ET.SubElement(root, core('connects'), {
                           xlink: f"#{state.id}"})
         if self.duality:
-            ET.SubElement(root, name_ns('duality', 'indoorCore'), {
+            ET.SubElement(root, core('duality'), {
                           xlink: f"#{self.duality.id}"})
         if self.geometry:
-            geometry = ET.SubElement(root, name_ns('geometry', 'indoorCore'))
+            geometry = ET.SubElement(root, core('geometry'))
             geometry.append(line_to_gml(self.geometry, f'G_{self.id}'))
         return root
 
@@ -474,29 +564,29 @@ class Cell(GMLFeature):
     def xml(self, ref: Optional[Set[str]] = None) -> ET.Element:
         root = super(Cell, self).xml(ref=ref)
         if self.geometry:
-            geometry_node = ET.SubElement(root, name_ns('Geometry2D', 'indoorCore'))
+            geometry_node = ET.SubElement(root, core('Geometry2D'))
             geometry_node.append(polygon_to_gml(self.geometry, f'G_{self.id}'))
         if self.duality:
-            ET.SubElement(root, name_ns('duality', 'indoorCore'), {
+            ET.SubElement(root, core('duality'), {
                           xlink: "#" + self.duality.id})
         for b in self.boundary:
             if ref is not None and b.id in ref:
-                ET.SubElement(root, name_ns('partialboundedBy', 'indoorCore'),
+                ET.SubElement(root, core('partialboundedBy'),
                               {xlink: f'#{b.id}'})
             else:
-                p = ET.SubElement(root, name_ns('partialboundedBy', 'indoorCore'))
+                p = ET.SubElement(root, core('partialboundedBy'))
                 p.append(b.xml(ref=ref))
                 if ref:
                     ref.add(b.id)
 
         if self.type != "CellSpace":
-            c = ET.SubElement(root, name_ns('class', 'indoorNavi'))
+            c = ET.SubElement(root, nav('class'))
             if self.cls_name:
                 c.text = self.cls_name
-            c = ET.SubElement(root, name_ns('function', 'indoorNavi'))
+            c = ET.SubElement(root, nav('function'))
             if self.function:
                 c.text = self.function
-            c = ET.SubElement(root, name_ns('usage', 'indoorNavi'))
+            c = ET.SubElement(root, nav('usage'))
             if self.usage:
                 c.text = self.usage
         return root
@@ -611,7 +701,7 @@ class Boundary(GMLFeature):
         if self.duality:
             ET.SubElement(root, 'indoorCore:duality', {
                           xlink: f"#{self.duality.id}"})
-        geometry = ET.SubElement(root, name_ns('geometry2D', 'indoorCore'))
+        geometry = ET.SubElement(root, core('geometry2D'))
         geometry.append(line_to_gml(self.geometry, f'G_{self.id}'))
         return root
 
@@ -789,25 +879,25 @@ class Layer(GMLFeature):
         root = super(Layer, self).xml()
 
         if self.usage:
-            u = ET.SubElement(root, name_ns('usage', 'indoorCore'))
+            u = ET.SubElement(root, core('usage'))
             u.text = self.usage
         if self.cls_name:
-            u = ET.SubElement(root, name_ns('class', 'indoorCore'))
+            u = ET.SubElement(root, core('class'))
             u.text = self.cls_name
         if self.function:
-            u = ET.SubElement(root, name_ns('function', 'indoorCore'))
+            u = ET.SubElement(root, core('function'))
             u.text = self.function
-        nodes = ET.SubElement(root, name_ns('nodes', 'indoorCore'), {
-                              name_ns('id', 'gml'): f'Nodes_{self.id}'})
-        edges = ET.SubElement(root, name_ns('edges', 'indoorCore'), {
-                              name_ns('id', 'gml'): f'Edges_{self.id}'})
+        nodes = ET.SubElement(root, core('nodes'), {
+                              gml('id'): f'Nodes_{self.id}'})
+        edges = ET.SubElement(root, name_ns('edges'), {
+                              gml('id'): f'Edges_{self.id}'})
         for state in self.states.values():
-            m = ET.SubElement(nodes, name_ns('stateMember', 'indoorCore'))
+            m = ET.SubElement(nodes, core('stateMember'))
             m.append(state.xml(ref=ref))
         for transition in self.transitions.values():
             if not hasattr(transition, 'start'):
                 continue
-            m = ET.SubElement(edges, name_ns('transitionMember', 'indoorCore'))
+            m = ET.SubElement(edges, core('transitionMember'))
             m.append(transition.xml(ref=ref))
         return root
 
@@ -1014,9 +1104,9 @@ class Map(GMLFeature):
     def xml(self, ref: Optional[Set[str]] = None) -> ET.Element:
         root = super(Map, self).xml()
         layers_node = ET.SubElement(
-            root, name_ns('spaceLayers', 'indoorCore'), {name_ns('id', 'gml'): "layers"})
+            root, core('spaceLayers'), {gml('id'): "layers"})
         for i in sorted(self.layers):
             layer = self.layers[i]
-            m = ET.SubElement(layers_node, name_ns('spaceLayerMember', 'indoorCore'))
+            m = ET.SubElement(layers_node, core('spaceLayerMember'))
             m.append(layer.xml(ref=ref))
         return root
