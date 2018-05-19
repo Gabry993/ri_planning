@@ -12,7 +12,9 @@ from shapely.geometry import LinearRing, LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import cascaded_union
 from typing import (Any, Callable, Dict, Iterator, List, Mapping, Optional,
-                    Set, Tuple, Type, TypeVar, Union, cast)
+                    Set, Tuple, Type, TypeVar, Union, cast, Iterable)
+
+from collections.abc import Mapping as MappingABC
 
 # import xml.etree.ElementTree as ET
 
@@ -219,6 +221,9 @@ class GMLFeature(ABC):
     type: str = 'GMLFeature'
     geometry: Optional[BaseGeometry]
     _meta: Dict[Tuple[Optional[str], str], Any]
+
+    def __hash__(self):
+        return hash(self.id)
 
     def _repr_svg_(self) -> str:
         from indoorgml.display.svg import svg_for
@@ -499,33 +504,7 @@ class Cell(GMLFeature):
     #         self.boundary.remove(boundary)
     #         boundary.remove_cell(self)
 
-    # def init_DCEL(self):
-    #     po = ops.polygonize([b.geometry for b in self.boundary])
-    #     if po is None:
-    #         raise NameError('Invalid geometry')
-    #     pp = list(po)
-    #     self.inner_edges = []
-    #     if len(pp) == 0:
-    #         raise NameError('Invalid geometry')
-    #     elif len(pp) == 1:
-    #         p = pp[0]
-    #         p = geometry.polygon.orient(p)
-    #         self.outer_edge = dcel.Edge.edgeInLineRing(p.exterior, face=self)
-    #         for lr in p.interiors:
-    #             self.inner_edges.append(dcel.Edge.edgeInLineRing(lr, face=self))
-    #     else:
-    #         for p in pp:
-    #             lr = p.exterior
-    #             if lr.intersects(self.geometry.exterior):
-    #                 if not lr.is_ccw:
-    #                     lr.coords = list(lr.coords)[::-1]
-    #                 self.outer_edge = dcel.Edge.edgeInLineRing(lr, face=self)
-    #             else:
-    #                 if lr.is_ccw:
-    #                     lr.coords = list(lr.coords)[::-1]
-    #                 self.inner_edges.append(dcel.Edge.edgeInLineRing(lr, face=self))
-    #         if not self.outer_edge:
-    #             raise NameError('Invalid geometry')
+
 
     # def reset_geometry(self) -> None:
     #     outer = geometry.LineString([e.origin for e in self.outer_edge.follow()])
@@ -640,43 +619,11 @@ class Boundary(GMLFeature):
     #     if start and end:
     #         yield start.to(end)
     #
-    # def find_chain_in_cell(self, cell: Cell) -> dcel.Chain:
-    #     edges = [cell.outer_edge] + cell.inner_edges
-    #     start = None
-    #     end = None
+
     #
-    #     for c in edges:
-    #         for e in c.follow():
-    #             if e.belongs_to_line(self.geometry):
-    #                 start = e
-    #                 end = e
-    #                 while(start.previous.belongs_to_line(self.geometry) and
-    #                       start.previous is not e):
-    #                     start = start.previous
+
     #
-    #                 if start.previous is not e:
-    #                     while end.next.belongs_to_line(self.geometry):
-    #                         end = end.next
-    #                 else:
-    #                     start = e
-    #                     end = e.previous
-    #                 break
-    #
-    #     if not start and not end:
-    #         raise NameError('DCEL no edge for indoorGML boundary')
-    #
-    #     return (start, end)
-    #
-    # def chain_in_cell(self, cell: Cell) -> Optional[dcel.Edge]:
-    #     return self._chains.get(cell.id, None)
-    #
-    # def set_chain_in_cell(self, cell: Cell, chain: dcel.Chain) -> None:
-    #     start, end = chain
-    #     if start is None or end is None:
-    #         return
-    #     self._chains[cell.id] = chain
-    #     for e in start.to(end):
-    #         e.face_boundary = self
+
 
     # def add_cell(self, cell: Cell) -> None:
     #     self.cells.append(cell)
@@ -685,12 +632,7 @@ class Boundary(GMLFeature):
     #     if cell in self.cells:
     #         self.cells.remove(cell)
 
-    # def init_DCEL(self) -> None:
-    #     for c in self.cells:
-    #         self.set_chain_in_cell(c, self.find_chain_in_cell(c))
-    #     if len(self.cells) == 2:
-    #         a, b = self.cells
-    #         dcel.glue_chain(self.chain_in_cell(a), self.chain_in_cell(b))
+
 
     # def reset_geometry(self) -> None:
     #     if len(self.cells) == 0:
@@ -748,16 +690,6 @@ class Layer(GMLFeature):
     type: str = 'SpaceLayer'
     map: 'Map'
     rtree_index: index.Index
-
-    # self._has_initialized_DCEL = False
-
-    # def init_DCEL(self) -> None:
-    #     if not self._has_initialized_DCEL:
-    #         for c in self.cells.values():
-    #             c.init_DCEL()
-    #         for b in self.boundaries.values():
-    #             b.init_DCEL()
-    #     self._has_initialized_DCEL = True
 
     def state_with_name(self, name: str) -> Optional[State]:
         try:
@@ -915,7 +847,7 @@ class Layer(GMLFeature):
         return cascaded_union([cell.geometry for cell in self.cells.values()])
 
 
-class Map(GMLFeature):
+class Map(GMLFeature, MappingABC):
     """Map is modeled after an indoorGML Multi Layered Graph"""
 
     layers: Dict[str, Layer]
@@ -943,6 +875,15 @@ class Map(GMLFeature):
     def add_layer(self, layer: Layer) -> None:
         self.layers[layer.id] = layer
         layer.map = self
+
+    def __len__(self):
+        return len(self.layers)
+
+    def __getitem__(self, uid: str) -> Layer:
+        return self.layers[uid]
+
+    def __iter__(self) -> Iterator:
+        return iter(self.layers)
 
     # def setCrsFromNode(self, node):
     #     n = node.find("WGS84:translation", nsmap)

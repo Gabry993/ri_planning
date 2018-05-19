@@ -2,8 +2,9 @@ import xml.etree.ElementTree as ET
 
 from indoorgml.map import (Boundary, Cell, GMLFeature, Layer, Map, State,
                            Transition)
+from indoorgml.dcel import Chain, Edge, DCEL
 from shapely.geometry import LineString, Polygon
-from typing import Callable, Dict, Optional, List, cast
+from typing import Callable, Dict, Optional, List, cast, Union
 
 from functools import lru_cache
 
@@ -124,6 +125,58 @@ def svg_for(gml: GMLFeature, width: int = 1000, height: int = 500) -> str:
     if e:
         g.append(e)
     return ET.tostring(svg, encoding='unicode')
+
+
+def svg_for_dcel(x: Union[Edge, DCEL, Chain], width: int = 1000, height: int = 500) -> str:
+    min_x, min_y, max_x, max_y = x.bounds
+    min_y, max_y = -max_y, -min_y
+    vb_height = max_y - min_y + 200
+    vb_width = max_x - min_x + 200
+
+    svg = ET.Element('svg', {'xmlns': SVG_NS, 'width': f'{width}', 'height': f'{height}',
+                             'viewBox': f"{min_x - 100} {min_y - 100} {vb_width} {vb_height}"})
+
+    defs = ET.SubElement(svg, 'defs')
+    marker = ET.SubElement(defs, 'marker', {'id': 'arrow', 'markerWidth': "10",
+                                            'markerHeight': "10", 'refX': "10", 'refY': "3",
+                                            'orient': "auto", 'markerUnits': "strokeWidth",
+                                            'viewBox': "0 0 20 20"})
+    ET.SubElement(marker, 'path', {'d': "M0,0 L0,6 L10,3 z", 'fill': "black",
+                                   'fill-opacity': "0.3"})
+    g = ET.SubElement(svg, 'g', {'transform': 'scale(1, -1)'})
+    e = None
+    if isinstance(x, Edge):
+        e = from_edge(x)
+    if isinstance(x, Chain):
+        e = from_chain(x)
+    if isinstance(x, DCEL):
+        e = from_dcel(x)
+    if e is not None:
+        g.append(e)
+    return ET.tostring(svg, encoding='unicode')
+
+
+def from_edge(edge: Edge) -> ET.Element:
+    x1, y1 = edge.origin.coords[0]
+    x2, y2 = edge.next.origin.coords[0]
+    return ET.Element('line', {'x1': f'{x1}', 'y1': f'{y1}', 'x2': f'{x2}', 'y2': f'{y2}',
+                               'stroke': "black", 'stroke-width': "5", 'stroke-opacity': "0.3",
+                               'marker-end': "url(#arrow)"})
+
+
+def from_chain(chain: Chain) -> ET.Element:
+    g = ET.Element('g')
+    for e in chain.edges:
+        g.append(from_edge(e))
+    return g
+
+
+def from_dcel(dcel: DCEL) -> ET.Element:
+    g = ET.Element('g')
+    for b, vs in dcel.boundary_chains.items():
+        for _, chain in vs.items():
+            g.append(from_chain(chain))
+    return g
 
 
 def from_gml(gml: GMLFeature,
