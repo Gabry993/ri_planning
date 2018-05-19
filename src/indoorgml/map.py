@@ -1,9 +1,9 @@
 import itertools
+import math
 from abc import ABC
 from collections import ChainMap, defaultdict
 from functools import lru_cache, partial
 from heapq import heappop, heappush
-
 import lxml.etree as ET
 
 import networkx as nx
@@ -11,8 +11,8 @@ from rtree import index
 from shapely.geometry import LinearRing, LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import cascaded_union
-from typing import (Any, Dict, List, Mapping, Optional, Set, Tuple, Type,
-                    TypeVar, cast)
+from typing import (Any, Callable, Dict, Iterator, List, Mapping, Optional,
+                    Set, Tuple, Type, TypeVar, Union, cast)
 
 # import xml.etree.ElementTree as ET
 
@@ -22,11 +22,10 @@ Frame = Tuple[float, float, float]
 Point2D = Tuple[float, float]
 BoundinxBox = Tuple[float, float, float, float]
 
-
 T = TypeVar('T', bound='GMLFeature')
 
-nsmap = {}
-nsmap_i = {}
+nsmap: Dict[str, str] = {}
+nsmap_i: Dict[str, str] = {}
 
 
 def add_ns(ET, name, url):
@@ -34,7 +33,7 @@ def add_ns(ET, name, url):
     nsmap_i[url] = name
 
 
-def name_ns(name, ns):
+def name_ns(name: str, ns: str) -> str:
     return f'{{{nsmap[ns]}}}{name}'
 
 
@@ -52,23 +51,29 @@ nav = partial(name_ns, ns='indoorNavi')
 xlink = name_ns('href', 'xlink')
 
 
-def meta2dict(meta: ET.Element, root=False) -> Dict:
+def meta2dict(meta: ET.Element) -> Dict[Tuple[Optional[str], str], Any]:
+    return dict(ChainMap(*(meta2dict_partial(m) for m in meta)))
+
+
+def meta2dict_partial(meta: ET.Element) -> Dict[Tuple[Optional[str], str], Any]:
     h, s, t = meta.tag.partition('}')
     if not t:
         ns = None
         t = meta.tag
     else:
         ns = h[1:]
+    v: Union[dict, str, bool]
     if len(meta) > 0:
-        v = dict(ChainMap(*(meta2dict(m) for m in meta)))
+        v = dict(ChainMap(*(meta2dict_partial(m) for m in meta)))
     else:
         if meta.text:
             v = meta.text
         else:
             v = True
-    if root:
-        return v
-    return {(nsmap_i.get(ns, None), t): v}
+    name = None
+    if ns:
+        name = nsmap_i.get(ns, None)
+    return {(name, t): v}
 
 
 def dict2meta_partial(meta: Dict) -> List[ET.Element]:
@@ -97,7 +102,7 @@ def dict2meta(meta: Dict) -> ET.Element:
 
 # ALMOST generic metadata:
 
-def add_bool_metadata(cls: Type[T], name: str):
+def add_bool_metadata(cls: Type[T], name: str) -> None:
     def set_meta(self: T, value: bool) -> None:
         if value:
             self._meta[('alma', name)] = True
@@ -172,13 +177,6 @@ def polygon_to_gml(polygon: Polygon, uid: Optional[str]) -> ET.Element:
     return node
 
 
-def is_stair(state):
-    if state.duality and state.duality.type == 'TranferSpace':
-        if('Stair' in state.function or [is_stair(s) for s in state.within].count(True)):
-            return True
-    return False
-
-
 _ns2types = {'indoorCore': ['CellSpace', 'CellSpaceBoundary', 'SpaceLayer', 'MultiLayeredGraph',
                             'State', 'Transition'],
              'indoorNavi': ['NavigableSpace', 'NavigableBoundary', 'GeneralSpace', 'TransferSpace',
@@ -207,6 +205,11 @@ def gml_pos_list(gml_pos_list: Optional[ET.Element]) -> Optional[List[Point2D]]:
     return None
 
 
+def polygon_for_bb(bb: BoundinxBox) -> Polygon:
+    minx, miny, maxx, maxy = bb
+    return Polygon(((minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)))
+
+
 class GMLFeature(ABC):
     """A minimal GML feature"""
 
@@ -215,7 +218,7 @@ class GMLFeature(ABC):
     description: Optional[str] = None
     type: str = 'GMLFeature'
     geometry: Optional[BaseGeometry]
-    _meta: Dict[Tuple[str, str], Any]
+    _meta: Dict[Tuple[Optional[str], str], Any]
 
     def _repr_svg_(self) -> str:
         from indoorgml.display.svg import svg_for
@@ -232,10 +235,11 @@ class GMLFeature(ABC):
     def save_xml(self, file_path: str) -> None:
         tree = ET.ElementTree()
         tree._setroot(self.xml_root)  # type: ignore
-        tree.write(file_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
+        tree.write(file_path, encoding='utf-8',
+                   xml_declaration=True, pretty_print=True)
 
     def xml(self, ref: Optional[Set[str]] = None) -> ET.Element:
-        ns = _gml_ns.get(self.type)
+        ns = _gml_ns[self.type]
         root = ET.Element(name_ns(self.type, ns), {gml('id'): self.id},
                           nsmap=nsmap)
         if self.name:
@@ -281,7 +285,7 @@ class GMLFeature(ABC):
 
         meta = node.find('gml:metaDataProperty/gml:GenericMetaData', nsmap)
         if meta is not None:
-            instance._meta = meta2dict(meta, root=True)
+            instance._meta = meta2dict(meta)
         else:
             instance._meta = {}
         return instance
@@ -308,7 +312,7 @@ class State(GMLFeature):
     overlaps: Mapping[str, Set[str]]
     intersects: Mapping[str, Set[str]]
     touches: Mapping[str, Set[str]]
-    within: Mapping[str, Set[str]]
+    inside: Mapping[str, Set[str]]
     up: List[str]
     down: List[str]
 
@@ -320,7 +324,7 @@ class State(GMLFeature):
 
         # according to indoorGML interlayer edges TYPES
         self.equals = defaultdict(set)
-        self.within = defaultdict(set)
+        self.inside = defaultdict(set)
         self.contains = defaultdict(set)
         self.overlaps = defaultdict(set)
         # OR of equals within contains overlaps
@@ -381,6 +385,28 @@ class State(GMLFeature):
             geometry.append(point_to_gml(self.geometry, f'G_{self.id}'))
         return root
 
+    def distance(self, position: Point2D) -> float:
+        """ returns:: (distance,  nearest position in state) """
+        p = Point(position)
+        if not self.duality:
+            return math.inf
+        polygon = self.duality.geometry
+        if p.intersects(polygon):
+            return 0
+        return p.distance(polygon.exterior)
+
+    def nearest_point(self, position: Point2D) -> Optional[Point2D]:
+        """ returns:: (distance,  nearest position in state) """
+        p = Point(position)
+        if not self.duality:
+            return None
+        polygon = self.duality.geometry
+        if p.intersects(polygon):
+            return position
+        ring = polygon.exterior
+        n_point = ring.interpolate(ring.project(p))
+        return n_point.coords[0]
+
 
 add_bool_metadata(State, name='open')
 add_bool_metadata(State, name='nontraversable')
@@ -396,7 +422,7 @@ class Transition(GMLFeature):
     end: State
 
     @property
-    def connects(self):
+    def connects(self) -> List[State]:
         return [self.start, self.end]
 
     def set_states(self, a: State, b: State, layer: 'Layer') -> None:
@@ -406,7 +432,8 @@ class Transition(GMLFeature):
         b.connects.append(self)
         if not self.geometry:
             if a.geometry and b.geometry and self.duality:
-                self.geometry = LineString([a.geometry, self.duality.geometry.centroid, b.geometry])
+                self.geometry = LineString(
+                    [a.geometry, self.duality.geometry.centroid, b.geometry])
         if self.geometry:
             self.weight = self.geometry.length
         else:
@@ -508,7 +535,7 @@ class Cell(GMLFeature):
     #     if self.duality:
     #         self.duality.reset_geometry()
 
-    def init_from_xml(self, node: ET.Element, layer: 'Layer'):
+    def init_from_xml(self, node: ET.Element, layer: 'Layer') -> None:
         external_ref = node.find('indoorCore:externalReference', nsmap)
         if external_ref is not None:
             raise NameError("Not implemented yet")
@@ -738,10 +765,6 @@ class Layer(GMLFeature):
         except StopIteration:
             return None
 
-    def states_in_box(self, bounding_box: BoundinxBox) -> List[State]:
-        return [self.states[i.object] for i
-                in self.rtree_index.intersection(bounding_box, objects=True)]
-
     @classmethod
     def from_xml(cls, node: ET.Element) -> 'Layer':  # type: ignore
         layer = super(cls, cls).from_xml(node)
@@ -796,80 +819,66 @@ class Layer(GMLFeature):
         for j, (i, state) in enumerate(layer.states.items()):
             state.init_from_xml(state_node[i], layer)
             if state.duality:
-                boundingBox = state.duality.geometry.bounds
-                layer.rtree_index.add(j, boundingBox, obj=state.id)
+                bounding_box = state.duality.geometry.bounds
+                layer.rtree_index.add(j, bounding_box, obj=state.id)
 
         for i, transition in layer.transitions.items():
             transition.init_from_xml(transition_node[i], layer)
             layer.graph.add_edge(transition.start.id, transition.end.id, i, id=i,
                                  weight=transition.weight)
 
-        layer.external_states = [s for s in layer.states.values() if not s.geometry]
+        layer.external_states = [
+            s for s in layer.states.values() if not s.geometry]
 
         # layer.init_DCEL();
 
         return layer
 
     # only for geometrical layers (transition  =  adjacency)
-    def nearest_state_with_position(self, position, block=lambda s: True):
-        s = self.state_in_layer_with_position(position)
-        if s and block(s):
-            return (0, s, position)
+
+    def nearest_states(self, position: Point2D) -> Iterator[Tuple[float, State]]:
+        heap: List[Tuple[float, State]] = []
         p = Point(position)
-        if not s:
-            s = [self.states.get(i.object) for i
-                 in self.index.nearest(position, objects=True)][0]
-            border = s.duality.geometry.exterior
-            d = p.distance(border)
-            p = border.interpolate(border.project(p))
-            if block(s):
-                return (d, s, p.coords[0])
-
-        visited = {}
-        visited[s.id] = True
-        nodes = [(0, s.id, position)]
-
-        while len(nodes):
-            (d, i, pos) = heappop(nodes)
-            s = self.states.get(i, None)
-            if s and block(s):
-                return (d, s, pos)
-            if self.graph.has_node(i):
-                neighbors = [self.states.get(n) for n
-                             in self.graph.neighbors(i)
-                             if not visited.get(n, False)]
-            else:
-                neighbors = []
-
-            for n in neighbors:
-                visited[n.id] = True
-
-                ls = self.graph[s.id][n.id]
-                if(len(ls) > 1):
-                    # TODO
-                    # tId = l[0]['id']
-                    tId = ls.keys()[0]
+        for i in self.rtree_index.nearest(position, num_results=len(self.states), objects=True):
+            s = self.states[i.object]
+            d = s.distance(position)
+            cell = cast(Cell, s.duality)
+            max_d = polygon_for_bb(cell.geometry.bounds).distance(p)
+            heappush(heap, (d, s))
+            while True:
+                d, s = heappop(heap)
+                if d < max_d:
+                    yield (d, s)
                 else:
-                    tId = ls.keys()[0]
-                    # tId = l[0]['id']
-                t = self.transitions.get(tId, None)
-                border = t.duality.geometry
-                d = p.distance(border)
-                np = border.interpolate(border.project(p))
-                heappush(nodes, (d, n.id, (np.x, np.y)))
-        return (0, None, position)
+                    heappush(heap, (d, s))
+                    break
 
-    def state_in_layer_with_position(self, position):
+    def nearest_state_among(self, position: Point2D,
+                            states_with: Callable[[State], bool]=lambda s: True
+                            ) -> Optional[State]:
+
+        for distance, state in self.nearest_states(position):
+            if states_with(state):
+                return state
+        return None
+
+    def state_at(self, position: Point2D) -> Optional[State]:
         p = Point(position)
-        states = [i.object for i
-                  in self.index.intersection(position, objects=True)
-                  if not self.states[i.object].duality.geometry.disjoint(p)]
-        if len(states):
-            return self.states.get(states[0], None)
-        else:
+        try:
+            i = next(i.object for i
+                     in self.rtree_index.intersection(position, objects=True)
+                     if not cast(Cell, self.states[i.object].duality).geometry.disjoint(p))
+            return self.states[i]
+        except StopIteration:
             return None
 
-    def navigationSubGraph(self):
+    def states_in_box(self, bounding_box: BoundinxBox) -> List[State]:
+        polygon = polygon_for_bb(bounding_box)
+        return [self.states[i.object] for i
+                in self.rtree_index.intersection(bounding_box, objects=True)
+                if polygon.intersects(cast(Cell, self.states[i.object].duality).geometry)]
+
+    def navigable_subgraph(self) -> nx.MultiGraph:
         return nx.MultiGraph(
             [(t.start.id, t.end.id, {'id': i, 'weight': t.weight})
              for i, t in self.transitions.items()
@@ -889,7 +898,7 @@ class Layer(GMLFeature):
             u.text = self.function
         nodes = ET.SubElement(root, core('nodes'), {
                               gml('id'): f'Nodes_{self.id}'})
-        edges = ET.SubElement(root, name_ns('edges'), {
+        edges = ET.SubElement(root, core('edges'), {
                               gml('id'): f'Edges_{self.id}'})
         for state in self.states.values():
             m = ET.SubElement(nodes, core('stateMember'))
@@ -902,7 +911,7 @@ class Layer(GMLFeature):
         return root
 
     @property
-    def geometry(self):
+    def geometry(self) -> BaseGeometry:  # type: ignore
         return cascaded_union([cell.geometry for cell in self.cells.values()])
 
 
@@ -935,7 +944,6 @@ class Map(GMLFeature):
         self.layers[layer.id] = layer
         layer.map = self
 
-
     # def setCrsFromNode(self, node):
     #     n = node.find("WGS84:translation", nsmap)
     #     if n is not None:
@@ -946,7 +954,7 @@ class Map(GMLFeature):
     #         self.angle = float(n.text)
 
     @classmethod
-    def from_file(cls, file_name):
+    def from_file(cls, file_name: str) -> 'Map':
         """Load a multi layered graph from an indoorGML document"""
         tree = ET.parse(file_name)
         node = tree.getroot()
@@ -954,7 +962,7 @@ class Map(GMLFeature):
             node = node.find("indoorCore:MultiLayeredGraph", nsmap)
         if node is not None:
             m = cls.from_xml(node)
-            m.file = file_name
+            m.source = file_name
             return m
         else:
             raise Exception('Malformed xml file: no MultiLayeredGraph tag')
@@ -984,7 +992,7 @@ class Map(GMLFeature):
         return ChainMap(*(layer.transitions for layer in self.layers.values()))
 
     @property
-    def geometry(self):
+    def geometry(self) -> BaseGeometry:  # type: ignore
         return cascaded_union([layer.geometry for layer in self.layers.values()])
 
 # TODO nav graph method of layer (nav sub graph for geo   graph for nav nOne esle)
@@ -1013,8 +1021,8 @@ class Map(GMLFeature):
         from de9im import patterns
         relations = (
             (patterns.equal, 'equals', 'equals'),
-            (patterns.within, 'within', 'contains'),
-            (patterns.contains, 'contains', 'within'),
+            (patterns.within, 'inside', 'contains'),
+            (patterns.contains, 'contains', 'inside'),
             (patterns.overlaps_regions, 'overlaps', 'overlaps'),
             (patterns.intersects, 'intersects', 'intersects'),
             (patterns.touches, 'touches', 'touches'))
@@ -1022,7 +1030,7 @@ class Map(GMLFeature):
         for s in self.states.values():
             # according to indoorGML interlayer edges TYPES
             s.equals = defaultdict(set)
-            s.within = defaultdict(set)
+            s.inside = defaultdict(set)
             s.contains = defaultdict(set)
             s.overlaps = defaultdict(set)
             # OR of equals within contains overlaps
@@ -1081,7 +1089,7 @@ class Map(GMLFeature):
                             continue
                         if g12 < MIN_AREA_TO_OVERLAP:
                             s1.overlaps[li2].remove(i2)
-                            s1.within[li2].add(i2)
+                            s1.inside[li2].add(i2)
                             s2.overlaps[li1].remove(i1)
                             s2.contains[li1].add(i1)
                             continue
@@ -1089,14 +1097,14 @@ class Map(GMLFeature):
                             s1.overlaps[li2].remove(i2)
                             s1.contains[li2].add(i2)
                             s2.overlaps[li1].remove(i1)
-                            s2.within[li1].add(i1)
+                            s2.inside[li1].add(i1)
                             continue
 
         def area(state_id):
             return self.states[state_id].duality.geometry.area
 
         for i, s in self.states.items():
-            ws = s.within.values() or [set()]
+            ws = s.inside.values() or [set()]
             s.up = sorted(set.union(*ws), key=area, reverse=False)
             cs = s.contains.values() or [set()]
             s.down = sorted(set.union(*cs), key=area, reverse=True)
