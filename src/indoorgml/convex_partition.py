@@ -5,7 +5,7 @@ from shapely.geometry import LinearRing, LineString, Point, Polygon
 from shapely.geometry.polygon import orient
 from shapely.ops import snap, split
 from typing import List, Tuple, Dict, Set, Optional
-
+import numpy as np
 Point2D = Tuple[float, float]
 
 
@@ -13,6 +13,22 @@ def partition(polygon: Polygon, rel_tol: float = 0, abs_tol: float = 0,
               dist_tol: float = 0, delta: int = 2) -> List[Polygon]:
     return [p.source for p in APolygon(polygon, rel_tol=rel_tol, abs_tol=abs_tol,
             dist_tol=dist_tol, delta=delta).partition]
+
+
+def h(a, b, c, d) -> bool:
+    d1 = np.array(b) - np.array(a)
+    d2 = np.array(d) - np.array(c)
+    return np.dot(d1, d2) / np.linalg.norm(d1) / np.linalg.norm(d2) < -0.5
+
+
+def h1(a, b, c, d) -> bool:
+    return np.dot(np.array(b) - np.array(a), np.array(d) - np.array(c)) < 0
+
+
+def hs(a, b, c) -> bool:
+    d1 = np.array(b) - np.array(a)
+    d2 = np.array(c) - np.array(b)
+    return np.cross(d1, d2) / np.linalg.norm(d1) / np.linalg.norm(d2) < -0.01
 
 
 FLAT = 0
@@ -33,6 +49,7 @@ def cut(line: LineString, distance: float) -> bool:
             cp = line.interpolate(distance)
             line.coords = coords[:i] + [(cp.x, cp.y)] + coords[i:]
             return True
+    return False
 
 
 def v_type(p: Point2D, vertex: Point2D, n: Point2D) -> int:
@@ -54,6 +71,7 @@ def simplify_ring(ring: LinearRing) -> LinearRing:
 
 
 def simplify(polygon: Polygon) -> Polygon:
+    return polygon
     return Polygon(simplify_ring(polygon.exterior), list(map(simplify_ring, polygon.interiors)))
 
 
@@ -66,9 +84,11 @@ class APolygon:
     delta: int
     cache: Dict[Tuple[Point2D, Point2D, Point2D], LineString]
     nr_vertices: Set[Point2D]
+    new_diagonals: Set[Tuple[Point2D, Point2D]]
 
     def visible(self, vertex: Point2D, point: Point2D) -> bool:
-        return self.source.covers(LineString([vertex, point]))
+        line = LineString([vertex, point])
+        return self.source.covers(line) and self.source.boundary.touches(line)
 
     def add_to_cache(self, p: Point2D, a: Point2D, b: Point2D) -> None:
         if self.visible(p, a) and self.visible(p, b):
@@ -101,8 +121,12 @@ class APolygon:
                 self.source = Polygon(e, self.source.interiors)
             return snap(LineString([e2, v2, v1, e1]), self.source.boundary, 0.01)
         while self.cache:
-            _, d, k = min(((d.length, d, k) for k, d in self.cache.items() if d),
-                          key=operator.itemgetter(0))
+            try:
+                _, d, k = min(((d.length, d, k) for k, d in self.cache.items() if d),
+                              key=operator.itemgetter(0))
+            except ValueError as e:
+                print("!!!!EEEEE!!!!!")
+                return None
             if self.source.boundary.covers(d):
                 # HACK: should never happend but it does
                 del self.cache[k]
@@ -140,11 +164,13 @@ class APolygon:
             self.abs_tol = parent.abs_tol
             self.dist_tol = parent.dist_tol
             self.delta = parent.delta
+            self.new_diagonals = set(parent.new_diagonals)
         else:
             self.rel_tol = rel_tol
             self.abs_tol = abs_tol
             self.dist_tol = dist_tol
             self.delta = delta
+            self.new_diagonals = set()
 
         if self.has_holes:
             return
@@ -155,21 +181,45 @@ class APolygon:
         delta = self.delta
 
         for i, ts in enumerate(list(zip(vs, vs[1:], vs[2:]))[:n]):
-            p = ts[1]
+            o, p, q = ts
+
             if has_source and p not in source_nr_vertices:
                 continue
-            if v_type(*ts) != NON_REGULAR:
+
+            if not hs(o, p, q):
                 continue
-            ws = vs[i + 1 + delta:i + 1 - delta + n + 1]
-            es = zip(ws, ws[1:])
+
+            # if v_type(o, p, q) != NON_REGULAR:
+            #     continue
+            # ws = vs[i + 1 + delta:i + 1 - delta + n + 1]
+            # es = zip(ws, ws[1:])
+
+            ws = vs[i + 2:i + 1 + n]
+            es = list(zip(ws, ws[1:]))
+            m = len(es)
+            for (a, b) in es[::-1]:
+                if h(a, b, o, p):
+                    break
+                m = m - 1
+            es = es[:m]
+            valid = False
             for (a, b) in es:
+                if not valid:
+                    if h(a, b, p, q):
+                        valid = True
+                    else:
+                        self.cache[(p, a, b)] = None
+                        continue
                 if has_source and (p, a, b) in source_cache:
                     d = source_cache[(p, a, b)]
                     self.cache[(p, a, b)] = d
                     if d:
                         self.nr_vertices.add(p)
                 else:
-                    self.add_to_cache(p, a, b)
+                    if (a, b) in self.new_diagonals:
+                        self.cache[(p, a, b)] = None
+                    else:
+                        self.add_to_cache(p, a, b)
 
     def split(self, diagonal: LineString) -> Tuple['APolygon', 'APolygon']:
         try:
@@ -196,5 +246,8 @@ class APolygon:
         diagonal = self.best_diagonal
         if not diagonal or not diagonal.is_valid or not diagonal.type == 'LineString':
             return [self]
+        d = (diagonal.coords[0], diagonal.coords[-1])
+        self.new_diagonals.add(d)
+        self.new_diagonals.add(d[::-1])
         left, right = self.split(diagonal)
         return left.partition + right.partition

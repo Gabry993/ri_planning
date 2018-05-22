@@ -430,9 +430,9 @@ class Transition(GMLFeature):
         return [self.start, self.end]
 
     def reset_geometry(self) -> None:
-        a = self.start.geometry
-        b = self.end.geometry
-        if a and b and self.duality:
+        if self.start and self.end and self.duality:
+            a = self.start.geometry
+            b = self.end.geometry
             self.geometry = LineString([a, self.duality.geometry.centroid, b])
         if self.geometry:
             self.weight = self.geometry.length
@@ -486,7 +486,7 @@ class Transition(GMLFeature):
 class Cell(GMLFeature):
     """Cell is modeled after an indoorGML CellSpace"""
 
-    boundary: List['Boundary']
+    boundary: Set['Boundary']
     duality: State
     geometry: Polygon
     type: str = 'CellSpace'
@@ -496,7 +496,7 @@ class Cell(GMLFeature):
 
     def __init__(self, uid: str) -> None:
         super(Cell, self).__init__(uid)
-        self.boundary = []
+        self.boundary = set()
 
     def init_from_xml(self, node: ET.Element, layer: 'Layer') -> None:
         external_ref = node.find('indoorCore:externalReference', nsmap)
@@ -510,7 +510,7 @@ class Cell(GMLFeature):
                 self.usage = n.text
             for n in node.findall('indoorNavi:function', nsmap):
                 self.function = n.text
-        self.boundary = []
+        self.boundary = set()
         for boundary_node in node.findall('indoorCore:partialboundedBy', nsmap):
             ref = boundary_node.get('{%s}href' % nsmap['xlink'])
             if ref is None:
@@ -518,7 +518,7 @@ class Cell(GMLFeature):
             else:
                 b_id = ref[1:]
             boundary = layer.boundaries[b_id]
-            self.boundary.append(boundary)
+            self.boundary.add(boundary)
             boundary.cells.append(self)
 
         polygonXML = node.find('indoorCore:Geometry2D/gml:Polygon', nsmap)
@@ -600,7 +600,7 @@ class Boundary(GMLFeature):
     def xml(self, ref: Optional[Set[str]] = None) -> ET.Element:
         root = super(Boundary, self).xml(ref=ref)
         if self.duality:
-            ET.SubElement(root, 'indoorCore:duality', {
+            ET.SubElement(root, core('duality'), {
                           xlink: f"#{self.duality.id}"})
         geometry = ET.SubElement(root, core('geometry2D'))
         geometry.append(line_to_gml(self.geometry, f'G_{self.id}'))
