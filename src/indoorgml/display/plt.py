@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Any, Callable, Tuple, Optional, Iterable
+from typing import Any, Callable, Tuple, Optional, Iterable, Type, Dict
 
 from matplotlib import pyplot as plt
 
@@ -128,10 +128,18 @@ def plot_layer(layer: Layer, ax: Any = plt,
     plot_cells(layer.cells.values(), ax=ax, layer=layer, color=color)
 
 
+Display = Callable[[GMLFeature, Any, Optional[Callable[[GMLFeature], Color]], bool], None]
+displays: Dict[Type[GMLFeature], Display] = {
+    Layer: plot_layer,
+    Transition: plot_transition,
+    Boundary: plot_boundary,
+    Cell: plot_cell,
+    State: plot_state}
+
+
 def plot(gml: GMLFeature, ax: Any = plt,
          color: Optional[Callable[[GMLFeature], Color]] = None,
          with_name: bool = False) -> None:
-    f = {Layer: plot_layer, Transition: plot_transition, Boundary: plot_boundary, Cell: plot_cell,
-         State: plot_state}.get(gml.__class__, plot_gml)
-    f(gml, ax=ax, color=color, with_name=with_name)
+    f: Display = displays.get(gml.__class__, plot_gml)  # type: ignore
+    f(gml, ax=ax, color=color, with_name=with_name)     # type: ignore
     plt.axis('equal')

@@ -225,7 +225,7 @@ def add_geometry(g: ET.Element, gml: GMLFeature, d: str,
 def from_transition(transition: Transition) -> Optional[ET.Element]:
     g = from_gml(transition)
     if g is not None:
-        attribs = {}
+        attribs: Dict[str, str] = {}
         if False and transition.duality:
             attribs['class'] = transition.duality.type
         add_geometry(g, transition, d=pathForLine(transition.geometry), attribs=attribs)
