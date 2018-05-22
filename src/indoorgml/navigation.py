@@ -2,10 +2,16 @@ from collections import defaultdict
 from itertools import combinations, product
 
 from indoorgml.map import Boundary, Cell, Layer, State, Transition, Map
+from indoorgml.convex_partition import partition
 from shapely.geometry import LineString, Polygon
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import cascaded_union, linemerge, split
-from typing import List, Optional
+from shapely.ops import cascaded_union, linemerge, split, snap
+from typing import List, Optional, Dict
+from tqdm import tqdm
+
+
+def intersection(g1: BaseGeometry, g2: BaseGeometry, tolerance: float = 0.1) -> BaseGeometry:
+    return snap(g2, g1, tolerance=0.1).intersection(g1)
 
 
 def obstacle(layer: Layer, clearance: float, tolerance: float = 0.1) -> BaseGeometry:
@@ -22,16 +28,30 @@ def all_lines(layers: List[Layer]) -> BaseGeometry:
     return cascaded_union([b.geometry for layer in layers for b in layer.boundaries.values()])
 
 
-def split_geometry(source: Polygon, lines: List[LineString],
+def g(ps: BaseGeometry) -> List[Polygon]:
+    if ps.type == 'Polygon':
+        return [ps]
+    if ps.type == 'MultiPolygon':
+        return list(ps)
+    return []
+
+
+def split_polygon(polygon: Polygon, line: LineString) -> List[Polygon]:
+    line = snap(line, polygon, 0.1)
+    return sum([g(x) for x in split(polygon, line)], [])
+
+
+def split_geometry(source: Polygon, lines: BaseGeometry,
                    obstacle: BaseGeometry) -> List[Polygon]:
     p = source.difference(obstacle)
     if p.is_empty:
         return []
-    geo = [p]
+    geo = g(p)
     if lines.type == 'LineString':
         lines = [lines]
     for l in lines:
-        geo = sum((list(split(p, l)) for p in geo), [])
+        geo = sum((split_polygon(p, l) for p in geo), [])
+        # geo = sum((list(split(p, l)) for p in geo), [])
     return geo
 
 
@@ -61,7 +81,7 @@ def add_copy_of_cell(layer: Layer, cell: Cell, geometry: List[Polygon]) -> List[
         state = add_copy_of_state(layer, cell.duality, uid=f'{layer.id}S{i}')
         c.duality = state
         state.duality = cell
-        state.geometry = polygon.representative_point()
+        state.geometry = polygon.centroid
         layer.rtree_index.add(i, polygon.bounds, obj=state.id)
         layer.graph.add_node(state.id)
 
@@ -71,28 +91,58 @@ def add_copy_of_cell(layer: Layer, cell: Cell, geometry: List[Polygon]) -> List[
 
     for cell1, cell2 in combinations(cells, 2):
         if f(cell1.geometry.boundary, cell2.geometry.boundary):
-            line = cell1.geometry.intersection(cell2.geometry)
-            add_boundary(layer, cell1, cell2, line)
+            # line = cell1.geometry.intersection(cell2.geometry)
+            line = intersection(cell1.geometry.boundary, cell2.geometry.boundary)
+            ls: List[LineString] = []
+            if line.type == 'MultiLineString':
+                line = linemerge(line)
+            if line.type == 'MultiLineString':
+                ls = line
+            elif line.type == 'LineString':
+                ls = [line]
+            for l in ls:
+                if l.length > 0.1:
+                    add_boundary(layer, cell1, cell2, l)
+            # else:
+            #     print('A', line.type)
+            #     print(cell1.geometry.wkt)
+            #     print(cell2.geometry.wkt)
+                # print(line.wkt)
     return cells
 
 
 def add_boundary(layer: Layer, cell: Cell, cell2: Optional[Cell], line: LineString) -> None:
+    if line.length < 0.1 or line.is_empty:
+        print('AAA')
+        return
     i = len(layer.boundaries) + 1
     b = Boundary(f'{layer.id}B{i}')
     if cell2:
         b.type = 'NavigableSpaceBoundary'
     b.geometry = line
-    layer.boundaries[b.id] = b
+    old_boundary = False
     for c in [cell, cell2]:
         if not c:
             continue
         for pb in c.boundary:
             if f(pb.geometry, line):
+                if b.geometry.equals(pb.geometry):
+                    b = pb
+                    old_boundary = True
+                    break
+
                 diff = pb.geometry.difference(line)
                 try:
                     pline = linemerge(diff)
                 except ValueError:
                     pline = diff
+                if pline.length == 0 or pline.is_empty:
+
+                    print('A', c.id, b.id, cell, cell2, pb.id, pb.cells,
+                          b.geometry.equals(pb.geometry))
+                    print(b.geometry.wkt)
+                    print(pb.geometry.wkt)
+                    raise NotImplemented
                 if pline.type == 'MultiLineString':
                     pb.geometry = pline[0]
                     if len(pline) > 1:
@@ -105,13 +155,17 @@ def add_boundary(layer: Layer, cell: Cell, cell2: Optional[Cell], line: LineStri
                 if t:
                     t.reset_geometry()
                     layer.graph[t.start][t.end][t.id]['weigth'] = t.geometry.length
+    layer.boundaries[b.id] = b
     if cell2:
         b.cells = [cell, cell2]
-        t = Transition(f'{layer.id}T{i}')
+        if old_boundary and b.duality:
+            t = b.duality
+        else:
+            t = Transition(f'{layer.id}T{i}')
+            layer.transitions[t.id] = t
         t.duality = b
         b.duality = t
         t.set_states(cell.duality, cell2.duality, layer)
-        layer.transitions[t.id] = t
         layer.graph.add_edge(t.start.id, t.end.id, t.id, id=t.id, weight=t.weight)
     else:
         b.cells = [cell, None]
@@ -121,40 +175,49 @@ def add_boundary(layer: Layer, cell: Cell, cell2: Optional[Cell], line: LineStri
 
 
 def from_layer(source: Layer, uid: str, clearance: float, tolerance: float = 0.1,
-               intersect: List[Layer] = []) -> Layer:
+               intersect: List[Layer] = [], convex: bool = True) -> Layer:
     layer = Layer(uid)
     layer.description = (f'Layer obtained from {source} adding a clearance of {clearance} cm')
     layer.cls_name = source.cls_name
     layer.usage = 'Navigation'
     layer._meta = source._meta
-    cells = defaultdict(list)
+    cells: Dict[Cell, List[Cell]] = defaultdict(list)
     lines = all_lines(intersect)
     obs = obstacle(source, clearance, tolerance)
 
-    for cell_id, cell in source.cells.items():
+    for cell_id, cell in tqdm(source.cells.items()):
         if cell.type == 'CellSpace':
             continue
         geometry = split_geometry(cell.geometry, lines, obs)
+        if convex:
+            geometry = sum([partition(p, dist_tol=1, abs_tol=10, rel_tol=0.001)
+                            for p in geometry], [])
+        geometry = [x for x in geometry if x.area > 1]
         if geometry:
             n_cell = add_copy_of_cell(layer, cell, geometry)
             cells[cell] = n_cell
 
-    for boundary in source.boundaries.values():
+    for boundary in tqdm(source.boundaries.values()):
         if len(boundary.cells) == 2:
             source_1, source_2 = boundary.cells
             cells1 = [c for c in cells[source_1] if f(boundary.geometry, c.geometry.boundary)]
             cells2 = [c for c in cells[source_2] if f(boundary.geometry, c.geometry.boundary)]
             for cell1, cell2 in product(cells1, cells2):
-                b = cell1.geometry.boundary.intersection(cell2.geometry.boundary)
-                b = b.intersection(boundary.geometry)
+                b = intersection(cell1.geometry.boundary, cell2.geometry.boundary)
+                b = intersection(b, boundary.geometry)
+                # b = cell1.geometry.boundary.intersection(cell2.geometry.boundary)
+                # b = b.intersection(boundary.geometry)
+                if b.type == 'MultiLineString':
+                    b = linemerge(b)
                 add_boundary(layer, cell1, cell2, b)
     return layer
 
 
-def navigation_layer(map_: Map, uid: str, clearance: float, tolerance: float = 0.1):
+def navigation_layer(map_: Map, uid: str, clearance: float, tolerance: float = 0.1,
+                     convex: bool = True) -> Layer:
 
     geometric_layer = next(l for l in map_.layers.values()
                            if l.cls_name == 'TOPOGRAPHIC' and l.usage == 'Geometry')
     layers = [l for l in map_.layers.values() if l.cls_name != 'TOPOGRAPHIC']
     return from_layer(geometric_layer, uid=uid, clearance=clearance, tolerance=tolerance,
-                      intersect=layers)
+                      intersect=layers, convex=convex)

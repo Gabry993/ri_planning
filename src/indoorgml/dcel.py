@@ -4,9 +4,14 @@ from functools import lru_cache
 import numpy as np
 
 from shapely import geometry
-from shapely.geometry import LinearRing, LineString
+from shapely.geometry import LinearRing, LineString, Polygon
 from shapely.ops import polygonize
-from typing import Any, Dict, List, NamedTuple, Optional
+from shapely.ops import split as split_geo
+from shapely.geometry.polygon import orient
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from collections import defaultdict
+
+# from edit import add_boundary_to_cells, add_boundary, add_copy_of_cell
 
 from .map import Boundary, BoundinxBox, Cell, Iterator, Layer
 
@@ -16,9 +21,20 @@ Vertex = Point2D
 once = lru_cache(1, False)
 
 
+def chains(polygon: Polygon, sign: int = 1) -> Tuple['Chain', List['Chain']]:
+    polygon = orient(polygon, sign)
+    e = Edge.from_ring(polygon.exterior)
+    es = [Edge.from_ring(ring) for ring in polygon.interiors]
+    return (Chain.loop(e), [Chain.loop(e) for e in es])
+
+
 class Chain(NamedTuple):
     start: 'Edge'
     end: 'Edge'
+
+    @classmethod
+    def loop(cls, e) -> 'Chain':
+        return cls(e, e.previous)
 
     @property
     def line(self) -> LineString:
@@ -31,6 +47,48 @@ class Chain(NamedTuple):
     @property
     def edges(self) -> Iterator['Edge']:
         return self.start.to(self.end)
+
+    @property
+    def face_boundary(self) -> Boundary:
+        return self.start.face_boundary
+
+    @face_boundary.setter
+    def face_boundary(self, boundary: Boundary) -> None:
+        for e in self.edges:
+            e.face_boundary = boundary
+
+    @property
+    def face(self) -> Cell:
+        return self.start.face
+
+    @face.setter
+    def face(self, cell: Cell) -> None:
+        for e in self.edges:
+            e.face = cell
+
+    @property
+    def twin(self) -> Optional['Chain']:
+        if self.start.twin and self.end.twin:
+            return Chain(self.end.twin, self.start.twin)
+        return None
+
+    @classmethod
+    def from_ring(cls, line: LinearRing, face: Cell) -> Tuple['Chain', 'Chain']:
+        e1 = Edge.from_ring(line, face)
+        e2 = Edge.from_ring(line, LinearRing[line.coords[::-1]], face)
+        chain1 = Chain(e1, e1.previous)
+        chain2 = Chain(e2, e2.previous)
+        glue_chain(chain1, chain2)
+        return (chain1, chain2)
+
+    def split(self, line: LineString) -> List['Chain']:
+        for e in self.edges:
+            es = split_geo(e, list)
+            if len(es):
+                p = es[1].coords[0]
+                e.split(p)
+                return [Chain(self.start, e)] + Chain(e.next, self.end).split(line)
+        return [self]
 
 
 # def orient(p1, p2, p3):
@@ -55,63 +113,58 @@ class DCEL:
     boundary_chains: Dict[Boundary, Dict[Cell, Chain]]
     inner_edges: Dict[Cell, List['Edge']]
     outer_edge: Dict[Cell, 'Edge']
+    outer_edges: List['Edge']
     layer: Layer
 
     def __init__(self, layer: Layer) -> None:
         self.layer = layer
         self.inner_edges = {}
         self.outer_edge = {}
+        self.outer_edges = []
+        self.boundary_chains = defaultdict(dict)
+        self.init_layer()
         for c in layer.cells.values():
             self.init_cell(c)
-        self.boundary_chains = {}
         for b in layer.boundaries.values():
-            self.boundary_chains[b] = {}
             self.init_boundary(b)
 
     @property
     def bounds(self) -> BoundinxBox:
         return self.layer.bounds
 
-    def init_cell(self, c: Cell) -> None:
-        po = polygonize([b.geometry for b in c.boundary])
-        if po is None:
-            raise NameError('Invalid geometry')
-        pp = list(po)
-        inner_edges = self.inner_edges[c] = []
-        if len(pp) == 0:
-            raise NameError('Invalid geometry')
-        elif len(pp) == 1:
-            p = pp[0]
-            p = geometry.polygon.orient(p)
-            self.outer_edge[c] = Edge.from_ring(p.exterior, face=c)
-            for lr in p.interiors:
-                inner_edges.append(Edge.from_ring(lr, face=c))
-        else:
-            for p in pp:
-                lr = p.exterior
-                if lr.intersects(c.geometry.exterior):
-                    if not lr.is_ccw:
-                        lr.coords = list(lr.coords)[::-1]
-                    self.outer_edge[c] = Edge.from_ring(lr, face=c)
-                else:
-                    if lr.is_ccw:
-                        lr.coords = list(lr.coords)[::-1]
-                    inner_edges.append(Edge.from_ring(lr, face=c))
-            if not self.outer_edge[c]:
-                raise NameError('Invalid geometry')
+    def init_layer(self) -> None:
+        polygons = polygonize([b.geometry for b in self.layer.boundaries.values()
+                               if len(b.cells) == 1])
+        for polygon in polygons:
+            c, cs = chains(polygon, sign=-1)
+            self.outer_edges.extend([c.start for c in [c] + cs])
 
-    def init_boundary(self, b: Boundary) -> None:
-        for c in b.cells:
-            chain = self.find_chain_in_cell(b, c)
-            self.set_chain_in_cell(b, c, chain)
-        if len(b.cells) == 2:
-            cell_a, cell_b = b.cells
-            chain_a = self.chain_in_cell(b, cell_a)
-            chain_b = self.chain_in_cell(b, cell_b)
-            glue_chain(chain_a, chain_b)
+    def init_cell(self, cell: Cell) -> None:
+        polygon = next(polygonize([b.geometry for b in cell.boundary]))
+        c, cs = chains(polygon, sign=1)
+        self.set_loop(c, cs, cell)
 
-    def find_chain_in_cell(self, b: Boundary, cell: Cell) -> Chain:
-        edges = [self.outer_edge[cell]] + self.inner_edges[cell]
+    def set_loop(self, chain: Chain, internal_chains: List[Chain], cell: Cell) -> None:
+        chain.face = cell
+        for c in internal_chains:
+            c.face = cell
+        self.outer_edge[cell] = chain.start
+        self.inner_edges[cell] = [c.start for c in internal_chains]
+
+    def set_chain(self, boundary: Boundary, chain: Chain, cell: Optional[Cell]) -> None:
+        self.boundary_chains[boundary][cell] = chain
+        chain.face_boundary = boundary
+
+    def init_boundary(self, boundary: Boundary) -> None:
+        for cell in boundary.cells:
+            chain = self.find_chain_in_cell(boundary, cell)
+            self.set_chain(boundary, chain, cell)
+        if len(boundary.cells) == 1:
+            chain = self.find_chain_in_layer(boundary)
+            self.set_chain(boundary, chain, None)
+        glue_chain(*self.boundary_chains[boundary].values())
+
+    def find_chain_in_edges(self, b: Boundary, edges: List['Edge']) -> Chain:
         start = None
         end = None
         for c in edges:
@@ -121,7 +174,6 @@ class DCEL:
                     end = e
                     while start.previous.belongs_to_line(b.geometry) and start.previous is not e:
                         start = start.previous
-
                     if start.previous is not e:
                         while end.next.belongs_to_line(b.geometry):
                             end = end.next
@@ -129,9 +181,56 @@ class DCEL:
                         start = e
                         end = e.previous
                     break
-        if not start or not end:
-            raise NameError('DCEL no edge for indoorGML boundary')
+        assert(start and end), 'Could not find chain for boundary'
         return Chain(start, end)
+
+    def find_chain_in_cell(self, b: Boundary, cell: Cell) -> Chain:
+        edges = [self.outer_edge[cell]] + self.inner_edges[cell]
+        return self.find_chain_in_edges(b, edges)
+
+    def find_chain_in_layer(self, b: Boundary) -> Chain:
+        return self.find_chain_in_edges(b, self.outer_edges)
+
+
+    # def init_boundary(self, boundary: Boundary) -> None:
+    #     for cell in boundary.cells:
+    #         chain = self.find_chain_in_cell(b, c)
+    #         self.set_chain_in_cell(b, c, chain)
+    #     if len(b.cells) == 2:
+    #         cell_a, cell_b = b.cells
+    #         chain_a = self.chain_in_cell(b, cell_a)
+    #         chain_b = self.chain_in_cell(b, cell_b)
+    #         glue_chain(chain_a, chain_b)
+
+    # def init_cell(self, c: Cell) -> None:
+    #     po = polygonize([b.geometry for b in c.boundary])
+    #     if po is None:
+    #         raise NameError('Invalid geometry')
+    #     pp = list(po)
+    #     inner_edges = self.inner_edges[c] = []
+    #     if len(pp) == 0:
+    #         raise NameError('Invalid geometry')
+    #     elif len(pp) == 1:
+    #         p = pp[0]
+    #         p = geometry.polygon.orient(p)
+    #         self.outer_edge[c] = Edge.from_ring(p.exterior, face=c)
+    #         for lr in p.interiors:
+    #             inner_edges.append(Edge.from_ring(lr, face=c))
+    #     else:
+    #         for p in pp:
+    #             lr = p.exterior
+    #             if lr.intersects(c.geometry.exterior):
+    #                 if not lr.is_ccw:
+    #                     lr.coords = list(lr.coords)[::-1]
+    #                 self.outer_edge[c] = Edge.from_ring(lr, face=c)
+    #             else:
+    #                 if lr.is_ccw:
+    #                     lr.coords = list(lr.coords)[::-1]
+    #                 inner_edges.append(Edge.from_ring(lr, face=c))
+    #         if not self.outer_edge[c]:
+    #             raise NameError('Invalid geometry')
+
+
 
     def set_chain_in_cell(self, b: Boundary, cell: Cell, chain: Chain):
         self.boundary_chains[b][cell] = chain
@@ -141,12 +240,26 @@ class DCEL:
     def chain_in_cell(self, b: Boundary, cell: Cell) -> Chain:
         return self.boundary_chains[b][cell]
 
+    def add_interior_chain(self, chain: Chain):
+        polygon = Polygon(chain.line)
+        face = add_copy_of_cell(self.layer, chain.face, polygon)
+        chain.twin.face = face
+        self.inner_edges[chain.face].append(chain.start)
+        chain.face.geometry = chain.face.geometry.difference(polygon)
+        self.outer_edge[face] = chain.twin.start
+        self.add_boundary_for_chain(chain, 'NavigableBoundary')
+
+    def add_boundary_for_chain(self, chain: Chain, type: str = 'NavigableBoundary') -> Boundary:
+        assert(chain.start.length < 0.01 and chain.end.length < 0.01)
+        boundary = add_boundary(self.layer, chain.line, type=type)
+        add_boundary_to_cells(boundary, chain.face, chain.twin.face)
+
 
 class Edge(LineString):
     """docstring for Edge"""
 
-    face: Cell
-    face_boundary: Boundary
+    face: Optional[Cell] = None
+    face_boundary: Optional[Boundary] = None
 
     def __init__(self, p1: Point2D, p2: Point2D) -> None:
         super(Edge, self).__init__([p1, p2])
@@ -236,7 +349,7 @@ class Edge(LineString):
                 return
 
     @classmethod
-    def from_ring(self, line: LinearRing, face: Cell):
+    def from_ring(self, line: LinearRing, face: Optional[Cell] = None) -> 'Edge':
         vertices = [geometry.Point(p) for p in line.coords[:-1]]
         nv = len(vertices)
         edges = [Edge(v, vertices[(i + 1) % nv]) for i, v in enumerate(vertices)]
@@ -244,3 +357,14 @@ class Edge(LineString):
             e.next = edges[(i + 1 + nv) % nv]
             e.face = face
         return edges[0]
+
+    def split(self, p: Point2D) -> None:
+        ne = Edge(p, self.next.origin)
+        ne.next = self.next
+        ne.face = self.face
+        ne.face_boundary = self.face_boundary
+        self.next = ne
+        self.coords[1] = ne.coords[0]
+        if self.twin and self.twin.origin != p:
+            self.twin.split(p)
+            self.twin, ne.twin = self.twin.next, self.twin

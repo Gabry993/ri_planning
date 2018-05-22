@@ -8,9 +8,31 @@ from typing import List, Tuple, Dict, Set, Optional
 
 Point2D = Tuple[float, float]
 
+
+def partition(polygon: Polygon, rel_tol: float = 0, abs_tol: float = 0,
+              dist_tol: float = 0, delta: int = 2) -> List[Polygon]:
+    return [p.source for p in APolygon(polygon, rel_tol=rel_tol, abs_tol=abs_tol,
+            dist_tol=dist_tol, delta=delta).partition]
+
+
 FLAT = 0
 REGULAR = 1
 NON_REGULAR = 2
+
+
+def cut(line: LineString, distance: float) -> bool:
+    # Cuts a line in two at a distance from its starting point
+    if distance <= 0.0 or distance >= line.length:
+        return False
+    coords = list(line.coords)
+    for i, p in enumerate(coords):
+        pd = line.project(Point(p))
+        if pd == distance:
+            return False
+        if pd > distance:
+            cp = line.interpolate(distance)
+            line.coords = coords[:i] + [(cp.x, cp.y)] + coords[i:]
+            return True
 
 
 def v_type(p: Point2D, vertex: Point2D, n: Point2D) -> int:
@@ -48,11 +70,15 @@ class APolygon:
     def visible(self, vertex: Point2D, point: Point2D) -> bool:
         return self.source.covers(LineString([vertex, point]))
 
-    def add_to_cache(self, p: Point2D, a: Point2D, b: Point2D):
+    def add_to_cache(self, p: Point2D, a: Point2D, b: Point2D) -> None:
         if self.visible(p, a) and self.visible(p, b):
             edge = LineString([a, b])
             p1 = edge.interpolate(edge.project(Point(p)))
-            diagonal = LineString((p, p1))
+            # e = self.source.exterior
+            # d1 = e.project(p1)
+            # if cut(e, d1):
+            #     self.source = Polygon(e, self.source.interiors)
+            diagonal = snap(LineString((p, p1)), self.source, 0.01)
         else:
             diagonal = None
         if diagonal:
@@ -60,14 +86,29 @@ class APolygon:
         self.cache[(p, a, b)] = diagonal
 
     @property
-    def best_diagonal(self) -> LineString:
+    def best_diagonal(self) -> Optional[LineString]:
         if self.has_holes:
             e = self.source.exterior
             i = min(self.source.interiors, key=lambda i: i.distance(e))
-            v1, v2 = sorted(i.coords, key=lambda i: e.distance(Point(i)))[:2]
-            return LineString([e.interpolate(e.project(Point(v2))), v2, v1,
-                               e.interpolate(e.project(Point(v1)))])
-        return min(((d.length, d) for d in self.cache.values() if d), key=operator.itemgetter(0))[1]
+            v1, v2 = sorted(i.coords[:-1], key=lambda x: e.distance(Point(x)))[:2]
+            d1 = e.project(Point(v1))
+            d2 = e.project(Point(v2))
+            e1 = e.interpolate(d1)
+            e2 = e.interpolate(d2)
+            c1 = cut(e, d1)
+            c2 = cut(e, d2)
+            if c1 or c2:
+                self.source = Polygon(e, self.source.interiors)
+            return snap(LineString([e2, v2, v1, e1]), self.source.boundary, 0.01)
+        while self.cache:
+            _, d, k = min(((d.length, d, k) for k, d in self.cache.items() if d),
+                          key=operator.itemgetter(0))
+            if self.source.boundary.covers(d):
+                # HACK: should never happend but it does
+                del self.cache[k]
+            else:
+                return d
+        return None
 
     @property
     def is_convex(self) -> bool:
@@ -123,19 +164,25 @@ class APolygon:
             es = zip(ws, ws[1:])
             for (a, b) in es:
                 if has_source and (p, a, b) in source_cache:
-                    self.cache[(p, a, b)] = source_cache[(p, a, b)]
-                    self.nr_vertices.add(p)
+                    d = source_cache[(p, a, b)]
+                    self.cache[(p, a, b)] = d
+                    if d:
+                        self.nr_vertices.add(p)
                 else:
                     self.add_to_cache(p, a, b)
 
     def split(self, diagonal: LineString) -> Tuple['APolygon', 'APolygon']:
-
         try:
             left, right = split(self.source, diagonal)
         except ValueError:
-            diagonal = snap(scale(diagonal, 1.01, 1.01, 1.01,
-                                  origin=diagonal.coords[0]), self.source, tolerance=0.01)
-            return self.split(diagonal)
+            diagonal1 = snap(scale(diagonal, 1.01, 1.01, 1.01,
+                                   origin=diagonal.coords[0]), self.source, tolerance=0.01)
+            try:
+                left, right = split(self.source, diagonal1)
+            except ValueError as e:
+                print(self.source.wkt)
+                print(diagonal1.wkt)
+                raise e
         return (APolygon(left, parent=self), APolygon(right, parent=self))
 
     @property
@@ -146,5 +193,8 @@ class APolygon:
     def partition(self) -> List['APolygon']:
         if self.is_convex:
             return [self]
-        left, right = self.split(self.best_diagonal)
+        diagonal = self.best_diagonal
+        if not diagonal or not diagonal.is_valid or not diagonal.type == 'LineString':
+            return [self]
+        left, right = self.split(diagonal)
         return left.partition + right.partition

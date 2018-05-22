@@ -12,7 +12,7 @@ import networkx as nx
 from rtree import index
 from shapely.geometry import LinearRing, LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import cascaded_union
+from shapely.ops import cascaded_union, snap
 from typing import (Any, Callable, Dict, Iterator, List, Mapping,
                     Optional, Set, Tuple, Type, TypeVar, Union, cast)
 
@@ -30,7 +30,7 @@ nsmap: Dict[str, str] = {}
 nsmap_i: Dict[str, str] = {}
 
 
-def add_ns(ET, name, url):
+def add_ns(name: str, url: str) -> None:
     nsmap[name] = url
     nsmap_i[url] = name
 
@@ -39,13 +39,13 @@ def name_ns(name: str, ns: str) -> str:
     return f'{{{nsmap[ns]}}}{name}'
 
 
-add_ns(ET, 'xlink', 'http://www.w3.org/1999/xlink')
-add_ns(ET, 'gml', 'http://www.opengis.net/gml/3.2')
-add_ns(ET, 'indoorCore', 'http://www.opengis.net/indoorgml/1.0/core')
-add_ns(ET, 'indoorNavi', 'http://www.opengis.net/indoorgml/1.0/navigation')
-add_ns(ET, 'xsi', 'http://www.w3.org/2001/XMLSchema-instance')
+add_ns('xlink', 'http://www.w3.org/1999/xlink')
+add_ns('gml', 'http://www.opengis.net/gml/3.2')
+add_ns('indoorCore', 'http://www.opengis.net/indoorgml/1.0/core')
+add_ns('indoorNavi', 'http://www.opengis.net/indoorgml/1.0/navigation')
+add_ns('xsi', 'http://www.w3.org/2001/XMLSchema-instance')
 # WGS84 localization
-add_ns(ET, 'alma', 'http://www.idsia.ch/alma')
+add_ns('alma', 'http://www.idsia.ch/alma')
 
 gml = partial(name_ns, ns='gml')
 core = partial(name_ns, ns='indoorCore')
@@ -191,18 +191,18 @@ def gml_id(node: ET.Element) -> str:
     return node.get('{%s}id' % nsmap['gml'])
 
 
-def gml_pos(gml_pos: Optional[ET.Element]) -> Optional[Point2D]:
+def gml_pos(gml_pos: Optional[ET.Element], precision: int = 1) -> Optional[Point2D]:
     if gml_pos is not None:
         if gml_pos.text is not None:
-            coords: List[float] = [float(n) for n in gml_pos.text.split()]
+            coords: List[float] = [round(float(n), precision) for n in gml_pos.text.split()]
             return tuple(coords[:2])  # type: ignore
     return None
 
 
-def gml_pos_list(gml_pos_list: Optional[ET.Element]) -> Optional[List[Point2D]]:
+def gml_pos_list(gml_pos_list: Optional[ET.Element], precision: int = 1) -> Optional[List[Point2D]]:
     if gml_pos_list is not None:
         if gml_pos_list.text:
-            coord = [float(n) for n in gml_pos_list.text.split()]
+            coord = [round(float(n), precision) for n in gml_pos_list.text.split()]
             return list(zip(coord[::2], coord[1::2]))
     return None
 
@@ -236,6 +236,7 @@ class GMLFeature(ABC):
             gml = GMLFeature('feature')
         """
         self.id = uid
+        self._meta = {}
 
     def save_xml(self, file_path: str) -> None:
         tree = ET.ElementTree()
@@ -291,8 +292,6 @@ class GMLFeature(ABC):
         meta = node.find('gml:metaDataProperty/gml:GenericMetaData', nsmap)
         if meta is not None:
             instance._meta = meta2dict(meta)
-        else:
-            instance._meta = {}
         return instance
 
     @property
@@ -430,11 +429,23 @@ class Transition(GMLFeature):
     def connects(self) -> List[State]:
         return [self.start, self.end]
 
+    def reset_geometry(self) -> None:
+        a = self.start.geometry
+        b = self.end.geometry
+        if a and b and self.duality:
+            self.geometry = LineString([a, self.duality.geometry.centroid, b])
+        if self.geometry:
+            self.weight = self.geometry.length
+        else:
+            self.weight = 0
+
     def set_states(self, a: State, b: State, layer: 'Layer') -> None:
         self.start = a
         self.end = b
-        a.connects.append(self)
-        b.connects.append(self)
+        if self not in a.connects:
+            a.connects.append(self)
+        if self not in b.connects:
+            b.connects.append(self)
         if not self.geometry:
             if a.geometry and b.geometry and self.duality:
                 self.geometry = LineString(
@@ -486,34 +497,6 @@ class Cell(GMLFeature):
     def __init__(self, uid: str) -> None:
         super(Cell, self).__init__(uid)
         self.boundary = []
-        # self.inner_edges = []
-
-    # @property
-    # def edges(self) -> List[dcel.Edge]:
-    #     return [self.outer_edge] + self.inner_edges
-
-    # def add_boundary(self, boundary: 'Boundary') -> None:
-    #     self.boundary.append(boundary)
-    #     boundary.add_cell(self)
-    #
-    # def remove_boundary(self, boundary: 'Boundary') -> None:
-    #     if boundary in self.boundary:
-    #         self.boundary.remove(boundary)
-    #         boundary.remove_cell(self)
-
-    # def reset_geometry(self) -> None:
-    #     outer = geometry.LineString([e.origin for e in self.outer_edge.follow()])
-    #     inner = [geometry.LineString([e.origin for e in edge.follow()])
-    #              for edge in self.inner_edges]
-    #     self.geometry = geometry.Polygon(outer, inner)
-    #     if self.duality:
-    #         self.duality.reset_geometry()
-
-    # @classmethod
-    # def from_polygon(cls, uid, polygon, prefix=''):
-    #     cell = Cell(f"{prefix}C{uid}")
-    #     cell.geometry = polygon
-    #     return cell
 
     def init_from_xml(self, node: ET.Element, layer: 'Layer') -> None:
         external_ref = node.find('indoorCore:externalReference', nsmap)
@@ -603,36 +586,7 @@ class Boundary(GMLFeature):
 
     def __init__(self, uid: str) -> None:
         super(Boundary, self).__init__(uid)
-        # self._chains: Dict[str: dcel.Edge] = {}
         self.cells = []
-
-    # def add_cell(self, cell: Cell) -> None:
-    #     self.cells.append(cell)
-
-    # def remove_cell(self, cell: Cell) -> None:
-    #     if cell in self.cells:
-    #         self.cells.remove(cell)
-
-    # def reset_geometry(self) -> None:
-    #     if len(self.cells) == 0:
-    #         return
-    #     chain = self.chain_in_cell(self.cells[0])
-    #     start, end = chain
-    #     vertices = [e.origin for e in start.to(end)] + [end.next.origin]
-    #
-    #     self.geometry = LineString(vertices)
-    #
-    #     if self.geometry.length < 0.01:
-    #         raise NameError('Boundary is too short')
-    #
-    #     if self.duality:
-    #         self.duality.reset_geometry()
-
-    # @classmethod
-    # def from_line(uid: str, line: LineString, prefix: str = ''):
-    #     b = Boundary(f"{prefix}B{uid}")
-    #     b.geometry = line
-    #     return b
 
     def init_from_xml(self, node: ET.Element, layer: 'Layer') -> None:
         line: Optional[List[Point2D]] = None
@@ -641,8 +595,7 @@ class Boundary(GMLFeature):
         if line:
             self.geometry = LineString(line)
         if not self.geometry.is_valid:
-            raise Exception("Invalid Boundary %s %s" %
-                            (self.id, self.geometry.wkt))
+            raise Exception("Invalid Boundary %s %s" % (self.id, self.geometry.wkt))
 
     def xml(self, ref: Optional[Set[str]] = None) -> ET.Element:
         root = super(Boundary, self).xml(ref=ref)
@@ -676,16 +629,19 @@ class Layer(GMLFeature):
         except StopIteration:
             return None
 
+    def __init__(self, uid: str) -> None:
+        super(Layer, self).__init__(uid)
+        self.graph = nx.MultiGraph()
+        self.rtree_index = index.Index()
+        self.states = {}
+        self.transitions = {}
+        self.cells = {}
+        self.boundaries = {}
+        self.external_states = []
+
     @classmethod
     def from_xml(cls, node: ET.Element) -> 'Layer':  # type: ignore
         layer = super(cls, cls).from_xml(node)
-        layer.graph = nx.MultiGraph()
-        layer.rtree_index = index.Index()
-        layer.states = {}
-        layer.transitions = {}
-        layer.cells = {}
-        layer.boundaries = {}
-
         state_node = {}
         transition_node = {}
         boundary_node = {}
@@ -726,6 +682,9 @@ class Layer(GMLFeature):
 
         for i, boundary in layer.boundaries.items():
             boundary.init_from_xml(boundary_node[i], layer)
+            b = boundary.geometry
+            for c in boundary.cells:
+                c.geometry = snap(c.geometry, b, 0.1)
 
         for j, (i, state) in enumerate(layer.states.items()):
             state.init_from_xml(state_node[i], layer)
@@ -781,7 +740,7 @@ class Layer(GMLFeature):
         except StopIteration:
             return None
 
-    def states_in_box(self, bounding_box: BoundinxBox) -> List[State]:
+    def states_crossing_box(self, bounding_box: BoundinxBox) -> List[State]:
         polygon = polygon_for_bb(bounding_box)
         return [self.states[i.object] for i
                 in self.rtree_index.intersection(bounding_box, objects=True)
@@ -831,38 +790,19 @@ class Map(GMLFeature, MappingABC):
     source: Optional[str] = None
     frame: Optional[Frame] = None
 
-    # def semantic_layer(self):
-    #     semantic_layers = [l for l in self.layers.values()
-    #                        if l.usage == "Semantic"]
-    #     if len(semantic_layers):
-    #         return semantic_layers[0]
-    #     else:
-    #         return None
-    #
-    # def navigation_layer(self):
-    #     navigation_layers = [l for l in self.layers.values()
-    #                          if l.usage == "Navigation"]
-    #     if len(navigation_layers):
-    #         return navigation_layers[0]
-    #     elif self.geometricLayer:
-    #         return self.geometricLayer
-    #     else:
-    #         return None
+    @property
+    def semantic_layers(self) -> List[Layer]:
+        return [l for l in self.layers.values() if l.usage == "Semantic"]
 
-    # def push_layer(self, layer):
-    #     self.addLayer(layer)
-    #     self.states.update(layer.states)
-    #     self.cells.update(layer.cells)
-    #     self.boundaries.update(layer.boundaries)
-    #     self.transitions.update(layer.transitionsmap)
-    #     self.find_interlayer_edges()
-    #     self.find_bounds()
+    @property
+    def navigation_layers(self) -> List[Layer]:
+        return [l for l in self.layers.values() if l.usage == "Navigation"]
 
     def add_layer(self, layer: Layer) -> None:
         self.layers[layer.id] = layer
         layer.map = self
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.layers)
 
     def __getitem__(self, uid: str) -> Layer:
@@ -959,7 +899,7 @@ class Map(GMLFeature, MappingABC):
                 if not s1.duality:
                     continue
                 g1 = s1.duality.geometry
-                for s2 in l2.states_in_box(g1.bounds):
+                for s2 in l2.states_crossing_box(g1.bounds):
                     if not s2.duality:
                         continue
                     g2 = s2.duality.geometry

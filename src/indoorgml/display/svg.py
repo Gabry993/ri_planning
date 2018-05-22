@@ -22,25 +22,41 @@ SVG_NS = 'http://www.w3.org/2000/svg'
 
 map_css = """
 
+.State circle {
+    fill: red;
+    r: 20;
+    stroke: orange;
+    stroke-width: 10;
+}
+
+.Transition path {
+    stroke: orange;
+    stroke-width: 10;
+    fill: none;
+    display: inline
+}
+
+path
+{
+    stroke: grey;
+    stroke-width: 10;
+}
+
 .TransitionSpace {
     fill: lightgreen;
-    stroke: none;
 }
 
 .GeneralSpace {
     fill: olive;
-    stroke: none;
 }
 
 .ConnectionSpace {
     fill: orange;
-    stroke: none;
 }
 
 
 .TOPOGRAPHIC .CellSpace {
     fill: black;
-    stroke: none;
 }
 
 .CellSpace {
@@ -60,6 +76,8 @@ map_css = """
     stroke-width: 20;
     fill: none;
 }
+
+
 
 """
 
@@ -206,10 +224,11 @@ def add_geometry(g: ET.Element, gml: GMLFeature, d: str,
 
 def from_transition(transition: Transition) -> Optional[ET.Element]:
     g = from_gml(transition)
-    if g:
-        attribs = {'class': transition.duality.type if transition.duality else ''}
-        add_geometry(g, transition, d=pathForLine(
-            transition.geometry), attribs=attribs)
+    if g is not None:
+        attribs = {}
+        if False and transition.duality:
+            attribs['class'] = transition.duality.type
+        add_geometry(g, transition, d=pathForLine(transition.geometry), attribs=attribs)
     return g
 
 
@@ -234,28 +253,33 @@ def from_cell(cell: Cell) -> Optional[ET.Element]:
 
 def from_state(state: State) -> Optional[ET.Element]:
     g = from_gml(state)
-    if g:
+    if g is not None:
         (x, y) = state.geometry.coords[0]
-        attribs = {'class': state.duality.type if state.duality else '',
-                   'r': '20', 'cx': str(x), 'cy': str(-y)}
+        attribs = {'cx': str(x), 'cy': str(y)}
+        if False and state.duality:
+            attribs['class'] = state.duality.type
         ET.SubElement(g, 'circle', attribs)
         if state.name:
             label = ET.SubElement(
-                g, 'text', {'x': str(x - 50), 'y': str(-(y - 50))})
+                g, 'text', {'x': str(x - 50), 'y': str((y - 50))})
             label.text = state.name
     return g
 
 
 def from_layer_graph(layer: Layer) -> ET.Element:
     g = ET.Element('g', {'class': 'graph'})
+    for _, _, t in layer.graph.edges:
+        n = from_transition(layer.transitions[t])
+        if n is not None:
+            g.append(n)
     for i in layer.graph.nodes():
         n = from_state(layer.states[i])
-        if n:
+        if n is not None:
             g.append(n)
     return g
 
 
-def from_layer(layer: Layer, with_graph: bool = False) -> ET.Element:
+def from_layer(layer: Layer, with_graph: bool = True) -> ET.Element:
     attribs = {'class': f'{layer.type} {layer.cls_name} {layer.usage}'}
     g = cast(ET.Element, from_gml(layer, attribs))
     g_cells = ET.SubElement(g, 'g', {'class': 'cells'})
