@@ -18,8 +18,8 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["ri_planning"]
-package-dir = {"ri_planning" = "ri_planning"}
+packages = ["ri_planning", "ri_planning.map", "ri_planning.planning"]
+package-dir = {"ri_planning" = "ri_planning", "ri_planning.map" = "ri_planning/map", "ri_planning.planning"="ri_planning/planning"}
 # packages = ["ri_planning", "indoorgml"]
 # package-dir = {"ri_planning" = ".", "indoorgml" = "src", "planners" = "src"}
 
