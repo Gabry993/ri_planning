@@ -1,2 +1,13 @@
 __pycache__
 *.pyc
+.mypy_cache
+.ipynb_checkpoints
+.DS_Store
+archive
+src
+example
+notebook
+activate.sh
+*.rdb
+requirements.txt
+*.egg-info
